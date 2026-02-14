@@ -1,0 +1,697 @@
+{
+  "name": "Email 2FA OTP Extractor Template",
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 3,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "96aca48a-019c-4932-aeb9-71cfc43e468a",
+              "leftValue": "={{ $json.include }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4256,
+        896
+      ],
+      "id": "d5be155f-390a-4125-bb7b-9f79d53278c2",
+      "name": "Should Process Email?"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Get data from previous node\nconst inputData = $json;\n\n// Get the formatted output from our OTP extraction\nconst markdown = inputData.formatted_output || '';\n\n// Convert markdown to HTML - treat \\n\\n and \\n the same\nlet html = markdown\n  .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>') // Bold\n  .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href=\"$2\">$1</a>') // Links\n  .replace(/\\n+/g, '<br>'); // All newlines become single breaks\n\n// Wrap in div\nhtml = '<div>' + html + '</div>';\n\n// Create plain text version (strip markdown formatting)\nconst plainText = markdown\n  .replace(/\\*\\*(.+?)\\*\\*/g, '$1') // Remove bold\n  .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '$1 ($2)') // Links to \"text (url)\"\n  .replace(/\\n+/g, '\\n'); // Collapse multiple newlines\n\n// Return in Matrix format\nreturn {\n  json: {\n    body: plainText,\n    msgtype: \"m.text\",\n    format: \"org.matrix.custom.html\",\n    formatted_body: html\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5600,
+        896
+      ],
+      "id": "34a115c5-5a6f-4011-8155-56fc263e4b6c",
+      "name": "Format Matrix Message"
+    },
+    {
+      "parameters": {
+        "roomId": "!YOUR_ROOM_ID:your.matrix.server",
+        "text": "={{ $json.formatted_body }}",
+        "messageFormat": "org.matrix.custom.html"
+      },
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [
+        5824,
+        896
+      ],
+      "id": "54e5ce53-db4c-4d1e-9c0b-1e636a13ef1c",
+      "name": "Send to Matrix"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const subject = $json.subject || 'Email';\nconst textHtml = $json.textHtml || '';\nconst message_id = $json.message_id || '';\n\n// DEBUG: Track all candidates and scoring details\nconst debugData = {\n  allCandidatesFound: [],\n  candidatesScored: [],\n  threshold: 5\n};\n\n// ========================================\n// CORE PRINCIPLE: Extract from VISIBLE, EMPHASIZED content ONLY\n// Ignore ALL metadata, tracking, CSS, comments, URLs\n// ========================================\n\n/**\n * Remove ALL noise that could contain false positive numbers\n */\nfunction removeNoise(html) {\n  return html\n    // Remove HTML comments (version numbers, template IDs)\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    // Remove style blocks (CSS contains color codes)\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    // Remove script blocks\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    // Remove ALL attributes (contains URLs, tracking IDs, inline styles)\n    .replace(/<(\\w+)[^>]*>/g, '<$1>')\n    // Remove closing tags normally\n    .replace(/<\\/(\\w+)>/g, '</$1>');\n}\n\n/**\n * Extract visible text only\n */\nfunction getVisibleText(html) {\n  return html\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#(\\d+);/g, (match, dec) => String.fromCharCode(dec))\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n// ========================================\n// UNIVERSAL OTP EXTRACTION\n// ========================================\n\nfunction extractOtpCodes(html) {\n  const candidates = new Map(); // code -> {contexts: [], emphasis: [], formatted: boolean}\n\n  const cleanHtml = removeNoise(html);\n  const plainText = getVisibleText(cleanHtml);\n\n  // ==========================================\n  // STEP 1: Find ALL numeric codes in VISIBLE text\n  // ==========================================\n  \n  // Find continuous digit codes (4-8 digits)\n  const continuousNumbers = plainText.matchAll(/\\b(\\d{4,8})\\b/g);\n  for (const match of continuousNumbers) {\n    const num = match[1];\n    if (!candidates.has(num)) {\n      candidates.set(num, { contexts: [], emphasis: [], formatted: false });\n      debugData.allCandidatesFound.push(num);\n    }\n  }\n  \n  // Find formatted codes (e.g., 934-122, 123 456, 12-34-56)\n  const formattedNumbers = plainText.matchAll(/\\b(\\d{2,4}[\\s\\-]\\d{2,4}(?:[\\s\\-]\\d{2,4})?)\\b/g);\n  for (const match of formattedNumbers) {\n    const code = match[1];\n    // Normalize for length check\n    const normalized = code.replace(/[\\s\\-]/g, '');\n    if (normalized.length >= 4 && normalized.length <= 8) {\n      if (!candidates.has(code)) {\n        candidates.set(code, { contexts: [], emphasis: [], formatted: true });\n        debugData.allCandidatesFound.push(code);\n      }\n    }\n  }\n\n  // ==========================================\n  // STEP 2: Score each code based on CONTEXT\n  // ==========================================\n\n  for (const [code, data] of candidates) {\n    // For formatted codes, create flexible search pattern\n    const searchPattern = data.formatted ? \n      code.replace(/[\\s\\-]/g, '\\\\s*[\\\\s\\\\-]\\\\s*') : \n      code;\n    \n    // Check if code appears near OTP keywords in plain text\n    const contextPattern = new RegExp(\n      `\\\\b(?:code|otp|pin|token|passcode|verification|security|authenticate|confirm|confirmation code|access code|login code)\\\\b[^.!?]{0,150}?${searchPattern}`,\n      'gi'\n    );\n    if (contextPattern.test(plainText)) {\n      data.contexts.push('keyword_proximity');\n    }\n\n    // Check if it's in a sentence like \"Here is your code\" or \"code is below\"\n    const sentencePattern = new RegExp(\n      `\\\\b(?:here\\\\s+is|below|use|enter|your)\\\\s+(?:your|the|this)?\\\\s*(?:new\\\\s+)?(?:confirmation\\\\s+)?(?:security\\\\s+)?(?:code|otp|pin)[^.!?]{0,150}?${searchPattern}`,\n      'gi'\n    );\n    if (sentencePattern.test(plainText)) {\n      data.contexts.push('explicit_introduction');\n    }\n\n    // Check for \"code: 1234\" or \"code is 1234\" patterns\n    const explicitPattern = new RegExp(\n      `\\\\b(?:code|otp|pin|token|passcode)\\\\s*(?:is|:)?\\\\s*${searchPattern}\\\\b`,\n      'gi'\n    );\n    if (explicitPattern.test(plainText)) {\n      data.contexts.push('explicit_label');\n    }\n    \n    // Check for \"confirmation code is below\" pattern (common in emails)\n    if (/confirmation\\s+code\\s+is\\s+below/gi.test(plainText)) {\n      data.contexts.push('confirmation_below');\n    }\n  }\n\n  // ==========================================\n  // STEP 3: Find EMPHASIZED codes (bold, headers, large fonts)\n  // ==========================================\n\n  // Bold/Strong tags\n  const boldPattern = /<(?:b|strong)>([\\s\\S]*?)<\\/(?:b|strong)>/gi;\n  let match;\n  while ((match = boldPattern.exec(cleanHtml)) !== null) {\n    const content = getVisibleText(match[1]);\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || (data.formatted && content.includes(code.replace(/[\\s\\-]/g, '')))) {\n        data.emphasis.push('bold');\n      }\n    }\n  }\n\n  // Header tags (H1-H6)\n  const headerPattern = /<h[1-6]>([\\s\\S]*?)<\\/h[1-6]>/gi;\n  while ((match = headerPattern.exec(cleanHtml)) !== null) {\n    const content = getVisibleText(match[1]);\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || (data.formatted && content.includes(code.replace(/[\\s\\-]/g, '')))) {\n        data.emphasis.push('header');\n      }\n    }\n  }\n  \n  // Large font detection (24px+) - check in original HTML\n  const largeFontPattern = /<td[^>]*font-size:\\s*2[4-9]|3\\d[^>]*>([\\s\\S]*?)<\\/td>/gi;\n  while ((match = largeFontPattern.exec(html)) !== null) {\n    const content = getVisibleText(match[1]);\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || (data.formatted && content.includes(code.replace(/[\\s\\-]/g, '')))) {\n        data.emphasis.push('large_font');\n      }\n    }\n  }\n\n  // ==========================================\n  // STEP 4: SCORE and FILTER\n  // ==========================================\n\n  const scored = [];\n  for (const [code, data] of candidates) {\n    let score = 0;\n    const penalties = [];\n\n    // Context scoring\n    if (data.contexts.includes('explicit_label')) score += 10;\n    if (data.contexts.includes('explicit_introduction')) score += 8;\n    if (data.contexts.includes('confirmation_below')) score += 8;\n    if (data.contexts.includes('keyword_proximity')) score += 5;\n\n    // Emphasis scoring\n    if (data.emphasis.includes('header')) score += 7;\n    if (data.emphasis.includes('large_font')) score += 6;\n    if (data.emphasis.includes('bold')) score += 4;\n    \n    // Bonus for formatted codes (more likely to be intentional OTPs)\n    if (data.formatted) score += 3;\n\n    // Penalties for obvious false positives\n    const numOnly = code.replace(/[\\s\\-]/g, '');\n    const numValue = parseInt(numOnly);\n\n    // Years (only for 4-digit unformatted codes)\n    if (!data.formatted && numOnly.length === 4 && numValue >= 1900 && numValue <= 2100) {\n      score -= 20;\n      penalties.push(`year_${code}`);\n    }\n\n    // All same digit\n    if (/^(\\d)\\1+$/.test(numOnly)) {\n      score -= 10;\n      penalties.push(`repeated_digits_${code}`);\n    }\n\n    // DEBUG: Record scoring details for this candidate\n    const debugEntry = {\n      number: code,\n      score: score,\n      signals: {\n        contexts: [...data.contexts],\n        emphasis: [...data.emphasis],\n        penalties: penalties,\n        formatted: data.formatted\n      }\n    };\n\n    // Only accept if score is positive\n    if (score > 0) {\n      scored.push({ code, score, data });\n      debugEntry.accepted = true;\n    } else {\n      debugEntry.accepted = false;\n      if (score <= 0 && penalties.length > 0) {\n        debugEntry.rejection_reason = penalties.join(', ');\n      } else if (score <= 0) {\n        debugEntry.rejection_reason = 'Score too low (no strong signals)';\n      }\n    }\n\n    debugData.candidatesScored.push(debugEntry);\n  }\n\n  // Sort by score and return top candidates\n  scored.sort((a, b) => b.score - a.score);\n\n  // Return codes with score >= 5 (has at least one strong signal)\n  return scored\n    .filter(item => item.score >= 5)\n    .map(item => item.code);\n}\n\n// ========================================\n// AUTH & CONFIRMATION LINK EXTRACTION\n// ========================================\n\nfunction extractAuthAndConfirmationLinks(html) {\n  const links = new Set();\n\n  // Find hrefs in ORIGINAL html (before cleaning)\n  const hrefPattern = /href=[\"']([^\"']+)[\"']/gi;\n  let match;\n\n  while ((match = hrefPattern.exec(html)) !== null) {\n    let url = match[1];\n    const lowerUrl = url.toLowerCase();\n\n    // SKIP non-relevant links\n    if (lowerUrl.startsWith('mailto:')) continue;\n    if (lowerUrl.startsWith('#')) continue;\n    if (/\\.(png|jpg|jpeg|gif|svg|css|js)$/i.test(lowerUrl)) continue;\n\n    // ACCEPT if auth-related OR confirmation-related\n    const isAuthOrConfirmation =\n      // Sign-in / Authentication\n      lowerUrl.includes('sign-in') ||\n      lowerUrl.includes('signin') ||\n      lowerUrl.includes('log-in') ||\n      lowerUrl.includes('/auth/') ||\n      lowerUrl.includes('magic-link') ||\n      lowerUrl.includes('magic_link') ||\n      lowerUrl.includes('magiclink') ||\n      lowerUrl.includes('passwordless') ||\n      lowerUrl.includes('one-click-login') ||\n      lowerUrl.includes('authenticate') ||\n      \n      // Email Confirmation / Verification\n      lowerUrl.includes('/verify') ||\n      lowerUrl.includes('/confirm') ||\n      lowerUrl.includes('verify-email') ||\n      lowerUrl.includes('verify_email') ||\n      lowerUrl.includes('verifyemail') ||\n      lowerUrl.includes('confirm-email') ||\n      lowerUrl.includes('confirm_email') ||\n      lowerUrl.includes('confirmemail') ||\n      lowerUrl.includes('email-verification') ||\n      lowerUrl.includes('email_verification') ||\n      lowerUrl.includes('email-confirm') ||\n      lowerUrl.includes('email_confirm') ||\n      lowerUrl.includes('confirmation') ||\n      lowerUrl.includes('validate') ||\n      lowerUrl.includes('activate') ||\n      lowerUrl.includes('activation') ||\n      \n      // Token-based URLs (common in confirmation emails)\n      (lowerUrl.includes('token=') && (\n        lowerUrl.includes('verify') || \n        lowerUrl.includes('confirm') || \n        lowerUrl.includes('activate')\n      )) ||\n      (lowerUrl.includes('code=') && (\n        lowerUrl.includes('verify') || \n        lowerUrl.includes('confirm')\n      ));\n\n    // REJECT common footer/header links\n    const isBoilerplate =\n      lowerUrl.includes('unsubscribe') ||\n      lowerUrl.includes('privacy') ||\n      lowerUrl.includes('terms') ||\n      lowerUrl.includes('help') ||\n      lowerUrl.includes('support') ||\n      lowerUrl.includes('letusknow') ||\n      lowerUrl.includes('footer') ||\n      lowerUrl.includes('/images/') ||\n      lowerUrl.includes('preferences') ||\n      lowerUrl.includes('manage') ||\n      lowerUrl.includes('account') ||\n      lowerUrl.includes('payment') ||\n      lowerUrl.includes('/login') ||\n      lowerUrl.includes('settings') ||\n      lowerUrl.includes('profile') ||\n      lowerUrl.includes('update') ||\n      lowerUrl.includes('change-password') ||\n      lowerUrl.includes('reset-password');\n\n    if (isAuthOrConfirmation && !isBoilerplate) {\n      links.add(url);\n    }\n  }\n\n  return Array.from(links);\n}\n\n// ========================================\n// MAIN EXECUTION\n// ========================================\n\ntry {\n  const otpCodes = extractOtpCodes(textHtml);\n  const authLinks = extractAuthAndConfirmationLinks(textHtml);\n\n  // ========================================\n  // FORMAT OUTPUT\n  // ========================================\n\n  let output = `📧 **${subject}** | ${new Date().toISOString().replace('T', ' ').substring(0, 19)}\\n`;\n\n  if (authLinks.length > 0) {\n    output += `🔗 **Auth/Confirmation Link(s):** `;\n    const linkTexts = authLinks.map((link, i) => {\n      // Determine link type for better labeling\n      const linkLower = link.toLowerCase();\n      let linkType = 'Link';\n      if (linkLower.includes('verify') || linkLower.includes('confirm')) {\n        linkType = 'Verify';\n      } else if (linkLower.includes('sign-in') || linkLower.includes('signin') || linkLower.includes('magic')) {\n        linkType = 'Sign-in';\n      } else if (linkLower.includes('activate')) {\n        linkType = 'Activate';\n      }\n      \n      return `[${linkType}${authLinks.length > 1 ? ` ${i + 1}` : ''}](${link})`.trim();\n    });\n    output += linkTexts.join(', ');\n    output += '\\n';\n  }\n\n  if (otpCodes.length > 0) {\n    output += `🔑 **One-Time Code${otpCodes.length > 1 ? 's' : ''}:** `;\n    output += otpCodes.join(', ');\n  }\n\n  if (otpCodes.length === 0 && authLinks.length === 0) {\n    output += `⚠️ No OTP codes or auth/confirmation links detected`;\n  }\n\n  // ========================================\n  // DEBUG: Build extraction summary\n  // ========================================\n  const acceptedCount = debugData.candidatesScored.filter(c => c.accepted).length;\n  const rejectedCount = debugData.candidatesScored.filter(c => !c.accepted).length;\n  const topScore = debugData.candidatesScored.length > 0\n    ? Math.max(...debugData.candidatesScored.map(c => c.score))\n    : 0;\n\n  // ========================================\n  // RETURN STRUCTURED DATA WITH DEBUG\n  // ========================================\n\n  return {\n    message_id: message_id,\n    subject: subject,\n    otp_codes: otpCodes,\n    auth_links: authLinks,\n    formatted_output: output,\n    metadata: {\n      has_otp: otpCodes.length > 0,\n      has_links: authLinks.length > 0,\n      otp_count: otpCodes.length,\n      link_count: authLinks.length\n    },\n    debug: {\n      total_candidates: debugData.allCandidatesFound.length,\n      unique_candidates: debugData.candidatesScored.length,\n      candidates_scored: debugData.candidatesScored,\n      threshold: debugData.threshold,\n      extraction_summary: {\n        accepted: acceptedCount,\n        rejected: rejectedCount,\n        top_score: topScore\n      }\n    }\n  };\n\n} catch (error) {\n  return {\n    message_id: message_id,\n    subject: subject,\n    otp_codes: [],\n    auth_links: [],\n    formatted_output: `❌ **Error processing email**\\n\\nError: ${error.message}`,\n    metadata: {\n      has_otp: false,\n      has_links: false,\n      error: error.message\n    },\n    debug: {\n      error: error.message,\n      stack: error.stack\n    }\n  };\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5376,
+        896
+      ],
+      "id": "644c2356-9473-459b-987b-af658c1b3c05",
+      "name": "Extract OTP and Links"
+    },
+    {
+      "parameters": {
+        "mailbox": "YOUR_FINANCE_FOLDER",
+        "postProcessAction": "nothing",
+        "options": {
+          "trackLastMessageId": true
+        }
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.1,
+      "position": [
+        3360,
+        704
+      ],
+      "id": "5ca781d4-447b-4fee-a1da-f79c0575f682",
+      "name": "Monitor Finance Emails"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5480caf9-ee43-4088-a329-f41d33596ed1",
+              "name": "textHtml",
+              "value": "={{ $json.textHtml }}",
+              "type": "string"
+            },
+            {
+              "id": "62735746-ac36-4832-8440-969945279bfe",
+              "name": "subject",
+              "value": "={{ $json.subject.replace(/(?:https?:\\/\\/)?(?:www\\.)?(?:[a-zA-Z0-9-]+\\.)*([a-zA-Z0-9-]+)\\.[a-zA-Z0-9]+[^\\s]*/g, '$1').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "68130c16-8585-471e-89d2-1d49c810be10",
+              "name": "metadata['message-id']",
+              "value": "={{ $json.metadata['message-id'] }}",
+              "type": "string"
+            },
+            {
+              "id": "57912410-1bdc-438a-bff9-3f5fd9398389",
+              "name": "attributes.uid",
+              "value": "={{ $json.attributes.uid }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3808,
+        896
+      ],
+      "id": "1eada275-d1e6-4b63-9263-6db14e0bc347",
+      "name": "Extract Email Content"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const subject = $json.subject?.toLowerCase() || '';\nconst textPlain = $json.textPlain?.toLowerCase() || '';\nconst textHtml = $json.textHtml || '';\nconst combined = subject + \" \" + textPlain;\n\n// ========================================\n// STEP 1: QUICK REJECTION - Financial Emails\n// ========================================\nconst financialIndicators = [\n  // Original indicators\n  'receipt',\n  'invoice',\n  'payment received',\n  'payment confirmation',\n  'order confirmation',\n  'purchase confirmation',\n  'transaction',\n  'billing',\n  'paid',\n  'refund',\n  'total amount',\n  'amount paid',\n  'subscription renewal',\n  'card ending',\n  'payment method',\n  'receipt number',\n  'invoice number',\n  'receipt from',\n  'invoice from',\n  \n  // NEW: Debt collection / Payment reminders\n  'past due',\n  'overdue',\n  'payment due',\n  'days past due',\n  'make a payment',\n  'make your payment',\n  'monthly payment',\n  'account number',\n  'loan payment',\n  'personal loan',\n  'payment reminder',\n  'payment notice',\n  'collection',\n  'balance due',\n  'amount due',\n  'outstanding balance',\n  'minimum payment',\n  'payment required',\n  'payment needed',\n  'servicing',\n  'loan servicing',\n  'debt collection',\n  'payment plan',\n  'payment options',\n  'autopay',\n  'auto-pay',\n  'missed payment',\n  'late payment',\n  'delinquent'\n];\n\nif (financialIndicators.some(term => combined.includes(term))) {\n  return {\n    ...$json,\n    include: false\n  };\n}\n\n// ========================================\n// UTILITY FUNCTIONS (from extraction code)\n// ========================================\n\nfunction removeNoise(html) {\n  return html\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')  // Remove comments\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')  // Remove CSS\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')  // Remove JS\n    .replace(/<(\\w+)[^>]*>/g, '<$1>')  // Remove all attributes\n    .replace(/<\\/(\\w+)>/g, '</$1>');\n}\n\nfunction getVisibleText(html) {\n  return html\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#(\\d+);/g, (match, dec) => String.fromCharCode(dec))\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\n// ========================================\n// STEP 2: OTP CODE DETECTION (Context + Scoring)\n// ========================================\n\nfunction hasHighConfidenceOTP(html) {\n  if (!html) return false;\n  \n  const cleanHtml = removeNoise(html);\n  const plainText = getVisibleText(cleanHtml);\n  \n  // Find all numeric codes (with or without separators)\n  const candidates = new Map();\n  \n  // Match continuous digits (4-8 digits)\n  const continuousNumbers = plainText.matchAll(/\\b(\\d{4,8})\\b/g);\n  for (const match of continuousNumbers) {\n    const num = match[1];\n    if (!candidates.has(num)) {\n      candidates.set(num, { contexts: [], emphasis: [], formatted: false });\n    }\n  }\n  \n  // Match formatted codes (e.g., 934-122, 123 456, 12-34-56)\n  const formattedNumbers = plainText.matchAll(/\\b(\\d{2,4}[\\s\\-]\\d{2,4}(?:[\\s\\-]\\d{2,4})?)\\b/g);\n  for (const match of formattedNumbers) {\n    const code = match[1];\n    // Normalize for storage (remove separators for consistency)\n    const normalized = code.replace(/[\\s\\-]/g, '');\n    if (normalized.length >= 4 && normalized.length <= 8) {\n      if (!candidates.has(code)) {\n        candidates.set(code, { contexts: [], emphasis: [], formatted: true });\n      }\n    }\n  }\n  \n  // Score each code based on context\n  for (const [code, data] of candidates) {\n    // For formatted codes, also check the unformatted version in context\n    const searchPattern = data.formatted ? \n      code.replace(/[\\s\\-]/g, '\\\\s*[\\\\s\\\\-]\\\\s*') : // Allow flexible matching\n      code;\n    \n    // Check proximity to OTP keywords\n    const contextPattern = new RegExp(\n      `\\\\b(?:code|otp|pin|token|passcode|verification|security|authenticate|confirm|confirmation code|access code|login code)\\\\b[^.!?]{0,150}?${searchPattern}`,\n      'gi'\n    );\n    if (contextPattern.test(plainText)) {\n      data.contexts.push('keyword_proximity');\n    }\n    \n    // Check explicit patterns: \"code is 1234\" or \"code: 1234\"\n    const explicitPattern = new RegExp(\n      `\\\\b(?:code|otp|pin|token|passcode)\\\\s*(?:is|:)?\\\\s*${searchPattern}\\\\b`,\n      'gi'\n    );\n    if (explicitPattern.test(plainText)) {\n      data.contexts.push('explicit_label');\n    }\n    \n    // Check introduction patterns: \"here is your code\", \"your code is below\"\n    const introPattern = new RegExp(\n      `\\\\b(?:here\\\\s+is|below|use|enter|your)\\\\s+(?:your|the|this)?\\\\s*(?:new\\\\s+)?(?:confirmation\\\\s+)?(?:security\\\\s+)?(?:code|otp|pin)[^.!?]{0,150}?${searchPattern}`,\n      'gi'\n    );\n    if (introPattern.test(plainText)) {\n      data.contexts.push('explicit_introduction');\n    }\n    \n    // Check for \"confirmation code is below\" pattern (common in emails)\n    if (/confirmation\\s+code\\s+is\\s+below/gi.test(plainText)) {\n      data.contexts.push('confirmation_below');\n    }\n  }\n  \n  // Check for emphasis (bold/headers) - need to check original HTML\n  const boldPattern = /<(?:b|strong)>([\\s\\S]*?)<\\/(?:b|strong)>/gi;\n  let match;\n  while ((match = boldPattern.exec(cleanHtml)) !== null) {\n    const content = getVisibleText(match[1]);\n    // Check both continuous and formatted codes\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || content.includes(code.replace(/[\\s\\-]/g, ''))) {\n        data.emphasis.push('bold');\n      }\n    }\n  }\n  \n  const headerPattern = /<h[1-6]>([\\s\\S]*?)<\\/h[1-6]>/gi;\n  while ((match = headerPattern.exec(cleanHtml)) !== null) {\n    const content = getVisibleText(match[1]);\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || content.includes(code.replace(/[\\s\\-]/g, ''))) {\n        data.emphasis.push('header');\n      }\n    }\n  }\n  \n  // Check for large font size or centered text (common for OTP display)\n  const largeFontPattern = /<td[^>]*font-size:\\s*2[4-9]|3\\d[^>]*>([\\s\\S]*?)<\\/td>/gi;\n  while ((match = largeFontPattern.exec(html)) !== null) {\n    const content = getVisibleText(match[1]);\n    for (const [code, data] of candidates) {\n      if (content.includes(code) || content.includes(code.replace(/[\\s\\-]/g, ''))) {\n        data.emphasis.push('large_font');\n      }\n    }\n  }\n  \n  // Score and filter\n  for (const [code, data] of candidates) {\n    let score = 0;\n    \n    // Context scoring\n    if (data.contexts.includes('explicit_label')) score += 10;\n    if (data.contexts.includes('explicit_introduction')) score += 8;\n    if (data.contexts.includes('confirmation_below')) score += 8;\n    if (data.contexts.includes('keyword_proximity')) score += 5;\n    \n    // Emphasis scoring\n    if (data.emphasis.includes('header')) score += 7;\n    if (data.emphasis.includes('large_font')) score += 6;\n    if (data.emphasis.includes('bold')) score += 4;\n    \n    // Bonus for formatted codes (they're more likely to be intentional OTPs)\n    if (data.formatted) score += 3;\n    \n    // Penalties for false positives\n    const numOnly = code.replace(/[\\s\\-]/g, '');\n    const numValue = parseInt(numOnly);\n    \n    // Year penalty (only for 4-digit unformatted codes)\n    if (!data.formatted && numOnly.length === 4 && numValue >= 1900 && numValue <= 2100) {\n      score -= 20;\n    }\n    \n    // Repeated digits penalty (1111, 2222, etc.)\n    if (/^(\\d)\\1+$/.test(numOnly)) {\n      score -= 10;\n    }\n    \n    // Accept if score >= 5 (at least one strong signal)\n    if (score >= 5) {\n      return true;\n    }\n  }\n  \n  return false;\n}\n\n// ========================================\n// STEP 3: AUTH & CONFIRMATION LINK DETECTION\n// ========================================\n\nfunction hasAuthOrConfirmationLink(html) {\n  if (!html) return false;\n  \n  const hrefPattern = /href=[\"']([^\"']+)[\"']/gi;\n  let match;\n  \n  while ((match = hrefPattern.exec(html)) !== null) {\n    const url = match[1].toLowerCase();\n    \n    // Skip non-relevant\n    if (url.startsWith('mailto:') || \n        url.startsWith('#') || \n        /\\.(png|jpg|jpeg|gif|svg|css|js)$/i.test(url)) {\n      continue;\n    }\n    \n    // Check if auth-related OR confirmation-related\n    const isAuthOrConfirmation = \n      // Sign-in / Authentication\n      url.includes('sign-in') ||\n      url.includes('signin') ||\n      url.includes('log-in') ||\n      url.includes('/auth/') ||\n      url.includes('magic-link') ||\n      url.includes('magic_link') ||\n      url.includes('magiclink') ||\n      url.includes('passwordless') ||\n      url.includes('one-click-login') ||\n      url.includes('authenticate') ||\n      \n      // Email Confirmation / Verification\n      url.includes('/verify') ||\n      url.includes('/confirm') ||\n      url.includes('verify-email') ||\n      url.includes('verify_email') ||\n      url.includes('verifyemail') ||\n      url.includes('confirm-email') ||\n      url.includes('confirm_email') ||\n      url.includes('confirmemail') ||\n      url.includes('email-verification') ||\n      url.includes('email_verification') ||\n      url.includes('email-confirm') ||\n      url.includes('email_confirm') ||\n      url.includes('confirmation') ||\n      url.includes('validate') ||\n      url.includes('activate') ||\n      url.includes('activation') ||\n      \n      // Token-based URLs (common in confirmation emails)\n      (url.includes('token=') && (\n        url.includes('verify') || \n        url.includes('confirm') || \n        url.includes('activate')\n      )) ||\n      (url.includes('code=') && (\n        url.includes('verify') || \n        url.includes('confirm')\n      ));\n    \n    // Exclude common footer/account management links\n    const isBoilerplate = \n      url.includes('unsubscribe') ||\n      url.includes('privacy') ||\n      url.includes('terms') ||\n      url.includes('help') ||\n      url.includes('support') ||\n      url.includes('preferences') ||\n      url.includes('manage') ||\n      url.includes('account') ||\n      url.includes('payment') ||\n      url.includes('/login') ||\n      url.includes('settings') ||\n      url.includes('profile') ||\n      url.includes('update') ||\n      url.includes('change-password') ||\n      url.includes('reset-password');\n    \n    if (isAuthOrConfirmation && !isBoilerplate) {\n      return true;\n    }\n  }\n  \n  return false;\n}\n\n// ========================================\n// MAIN FILTER LOGIC\n// ========================================\n\nconst hasOTP = hasHighConfidenceOTP(textHtml);\nconst hasLink = hasAuthOrConfirmationLink(textHtml);\n\nreturn {\n  ...$json,\n  include: hasOTP || hasLink\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        896
+      ],
+      "id": "d28e9d8d-71cb-4964-b484-7ab1d7966893",
+      "name": "Filter OTP Emails"
+    },
+    {
+      "parameters": {
+        "postProcessAction": "nothing",
+        "options": {
+          "trackLastMessageId": true
+        }
+      },
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2.1,
+      "position": [
+        3360,
+        896
+      ],
+      "id": "ad1e3c4e-8c26-4223-a480-9e7d5885a2a7",
+      "name": "Monitor Inbox"
+    },
+    {
+      "parameters": {
+        "path": "otp-extractor-webhook",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        3360,
+        1088
+      ],
+      "id": "363a2402-be92-431a-affd-443fa4b78c59",
+      "name": "Webhook",
+      "webhookId": "otp-extractor-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "n8n_otp_processed_emails",
+          "mode": "list",
+          "cachedResultName": "n8n_otp_processed_emails"
+        },
+        "where": {
+          "values": [
+            {
+              "column": "message_id",
+              "value": "={{ $json[\"message-id\"] }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "66aeb080-473d-46d7-ab71-6890c1dd5d3c",
+      "name": "Check if Already Processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4704,
+        896
+      ],
+      "executeOnce": false,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "mode": "name",
+          "value": "n8n_otp_processed_emails"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $('Extract OTP and Links').item.json.message_id }}",
+            "email_subject": "={{ $('Extract OTP and Links').item.json.subject }}",
+            "had_otp": "={{ $('Extract OTP and Links').item.json.metadata.has_otp }}",
+            "had_links": "={{ $('Extract OTP and Links').item.json.metadata.has_links }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": true
+            },
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_subject",
+              "displayName": "email_subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "processed_at",
+              "displayName": "processed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "had_otp",
+              "displayName": "had_otp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "had_links",
+              "displayName": "had_links",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "1cdbb682-6d54-4869-9216-16a648d5c9f3",
+      "name": "Store Processed Email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        6048,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "keep": "lastItems"
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        3584,
+        896
+      ],
+      "id": "e830c3b0-d8d4-4df2-ba66-e81846102c71",
+      "name": "Limit"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6da43c76-9130-47b6-94a7-6447aa104412",
+              "leftValue": "={{ $json }}",
+              "rightValue": "",
+              "operator": {
+                "type": "object",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4928,
+        896
+      ],
+      "id": "c2a5918d-e82c-4539-b62c-c24b5b1b192b",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "18726ff3-6d16-4ce6-8a65-e18ff9c86beb",
+              "name": "textHtml",
+              "value": "={{ $json.textHtml }}",
+              "type": "string"
+            },
+            {
+              "id": "eeb3e9e4-65c8-4850-a1df-d523bfa54d1f",
+              "name": "subject",
+              "value": "={{ $json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "a428a18c-e5f8-4c3f-aefc-3873104cb805",
+              "name": "message-id",
+              "value": "={{ $json.metadata[\"message-id\"] }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4480,
+        896
+      ],
+      "id": "00388391-0ec1-4ea5-bf39-ae29b65a80f2",
+      "name": "Edit Fields1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "34f51e68-0ca7-45ea-aaf3-d94fb2ce56b9",
+              "name": "textHtml",
+              "value": "={{ $('Edit Fields1').item.json.textHtml }}",
+              "type": "string"
+            },
+            {
+              "id": "bc744f14-5b10-495e-bad5-4300369bdadb",
+              "name": "subject",
+              "value": "={{ $('Edit Fields1').item.json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "3a2dbe1b-c0dc-4c17-ad99-9c3e9915fbb4",
+              "name": "message_id",
+              "value": "={{ $('Edit Fields1').item.json[\"message-id\"] }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        5152,
+        896
+      ],
+      "id": "526f8a71-512f-4c0f-a18a-40831958f107",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "content": "## 📋 PREREQUISITES\n\n**Credentials needed:**\n1. **IMAP Email Account(s)** — to monitor for 2FA emails\n2. **PostgreSQL Database** — for deduplication tracking\n3. **Matrix Account** — for forwarding OTP codes\n\n**Database setup:**\nCreate a table for tracking processed emails:\n```sql\nCREATE TABLE processed_emails (\n  id SERIAL PRIMARY KEY,\n  message_id TEXT UNIQUE,\n  processed_at TIMESTAMP DEFAULT NOW()\n);\n```\n\n**To set up:**\n1. Import this workflow into n8n\n2. Create IMAP credential(s) for your email\n3. Create PostgreSQL credential\n4. Create Matrix credential and update room ID\n5. Update IMAP mailbox folder names",
+        "height": 528,
+        "width": 430
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        3616,
+        256
+      ],
+      "name": "Sticky Prerequisites",
+      "id": "a61d8d71-4331-49f7-9be9-38f65290cb28",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## 🔔 NOTIFICATIONS\n\nThis template uses **Matrix** for forwarding extracted OTP codes.\n\nYou can replace the Matrix nodes with any preferred notification service:\n- **Slack** — use the Slack node\n- **Discord** — use the Discord node\n- **Telegram** — use the Telegram node (great for mobile alerts)\n- **Pushover** — use HTTP Request node with Pushover API\n\nJust replace each Matrix node with your preferred service and map the formatted message field accordingly.",
+        "height": 532,
+        "width": 430
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        4544,
+        256
+      ],
+      "name": "Sticky Notifications",
+      "id": "ca30a0d8-cc20-4754-84c4-632f0c7a02f3",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## ⚙️ HOW TO CUSTOMIZE\n\n**Email Sources:**\n- Add/remove IMAP monitor nodes for different mailboxes\n- Adjust the mailbox folder names to match your email setup\n\n**OTP Patterns:**\n- The \"Filter OTP Emails\" node has configurable patterns for detecting 2FA emails\n- The \"Extract OTP and Links\" node uses regex scoring to find codes and sign-in links\n- Add new patterns for services not yet covered\n\n**Deduplication:**\n- PostgreSQL tracks processed message IDs to prevent duplicate alerts\n- Webhook endpoint allows manual/external triggering\n\n**Security Note:** This workflow processes sensitive authentication data. Ensure your n8n instance and notification channel are secured.",
+        "height": 532,
+        "width": 430
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        4080,
+        256
+      ],
+      "name": "Sticky Customization",
+      "id": "af67e9e5-aedd-45db-9875-60c1c25e19e3",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {
+    "Monitor Inbox": [
+      {
+        "json": {
+          "textHtml": "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\"><html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\" xml:lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"x-apple-disable-message-reformatting\"><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"><title>ð Please confirm your email</title><style>body{-webkit-text-size-adjust:none;font-family:helvetica neue,helvetica,arial,sans-serif;height:100%;margin:0;width:100%!important}a{color:#3869d4}a img{border:none}td{word-break:break-word}.preheader{mso-hide:all;display:none!important;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;visibility:hidden}body,td,th{font-family:helvetica neue,helvetica,arial,sans-serif}h1{font-size:24px}h1,h2{color:#333;font-weight:700;margin-top:0;text-align:left}h2{font-size:16px}h3{color:#333;font-size:14px;font-weight:700;margin-top:0;text-align:left}td,th{font-size:16px}blockquote,ol,p,ul{font-size:16px;line-height:1.625;margin:.4em 0 1.1875em}p.sub{font-size:13px}.align-right{text-align:right}.align-left{text-align:left}.align-center{text-align:center}.button{-webkit-text-size-adjust:none;background-color:#ff641b;border-color:#ff641b;border-radius:3px;border-style:solid;border-width:15px 25px;box-shadow:0 2px 3px rgba(0,0,0,.16);box-sizing:border-box;color:#fff!important;display:inline-block;text-decoration:none}.button--green{background-color:#22bc66;border-color:#22bc66;border-style:solid;border-width:10px 18px}.button--green:hover{background-color:#1b9255;border-color:#1b9255;border-style:solid;border-width:10px 18px;color:#fff!important}.button--red{background-color:#ff6136;border-color:#ff6136;border-style:solid;border-width:15px 25px}.button--red:hover{background-color:#c23f00;border-color:#c23f00;border-style:solid;border-width:15px 25px;color:#fff!important}@media only screen and (max-width:500px){.button{text-align:center!important;width:100%!important}}.attributes{margin:0 0 21px}.attributes_content{background-color:#f4f4f7;padding:16px}.attributes_item{padding:0}.related{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:0;padding:25px 0 0;width:100%;-premailer-width:100%}.related_item{color:#cbcccf;font-size:15px;line-height:18px;padding:10px 0}.related_item-title{display:block;margin:.5em 0 0}.related_item-thumb{display:block;padding-bottom:10px}.related_heading{border-top:1px solid #cbcccf;padding:25px 0 10px;text-align:center}.discount{-premailer-cellpadding:0;-premailer-cellspacing:0;background-color:#f4f4f7;border:2px dashed #cbcccf;margin:0;padding:24px;width:100%;-premailer-width:100%}.discount_body,.discount_heading{text-align:center}.discount_body{font-size:15px}.social{width:auto}.social td{padding:0;width:auto}.social_icon{height:20px;margin:0 8px 10px;padding:0}.purchase{padding:35px 0}.purchase,.purchase_content{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:0;width:100%;-premailer-width:100%}.purchase_content{padding:25px 0 0}.purchase_item{color:#51545e;font-size:15px;line-height:18px;padding:10px 0}.purchase_heading{border-bottom:1px solid #eaeaec;padding-bottom:8px}.purchase_heading p{color:#85878e;font-size:12px;margin:0}.purchase_footer{border-top:1px solid #eaeaec;padding-top:15px}.purchase_total{color:#333;font-weight:700;margin:0;text-align:right}.purchase_total--label{padding:0 15px 0 0}body{background-color:#e4e4e4}body,p{color:#51545e}.email-wrapper{background-color:#e4e4e4}.email-content,.email-wrapper{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:0;padding:0;width:100%;-premailer-width:100%}.email-content{border-radius:4px;box-shadow:0 4px 20px rgba(1,38,82,.02)}.email-masthead{padding:24px 0;text-align:center}.email-masthead_logo{width:94px}.email-body{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:0;padding:0;width:100%;-premailer-width:100%}.email-body_inner{background-color:#fff}.email-body_inner,.email-footer{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:0 auto;padding:0;width:600px;-premailer-width:600px}.email-footer{text-align:center}.email-footer p{color:#7a7a7a}.body-action{-premailer-cellpadding:0;-premailer-cellspacing:0;margin:30px auto;padding:0;text-align:center;width:100%;-premailer-width:100%}.body-sub{border-top:1px solid #eaeaec;margin-top:25px;padding-top:25px}.content-cell{padding:24px 45px}@media only screen and (max-width:600px){.email-body_inner,.email-footer{width:100%!important}}@media(prefers-color-scheme:dark){.email-body,.email-body_inner,.email-content,.email-footer,.email-masthead,.email-wrapper,body{background-color:#333!important;color:#fff!important}blockquote,h1,h2,h3,ol,p,ul{color:#fff!important}.attributes_content,.discount{background-color:#222!important}.email-masthead_name{text-shadow:none!important}}.body,body,html{background:#f3f3f3!important}.container.header{background:#f3f3f3}.body-drip{border-top:8px solid #639}.header{background:#8a8a8a}.header .columns{padding-bottom:0}.header p{color:#fff;padding-top:15px}.header .wrapper-inner{padding:20px}.header .container{background:0 0}table.button.facebook table td{background:#3b5998!important;border-color:#3b5998}table.button.twitter table td{background:#1daced!important;border-color:#1daced}table.button.google table td{background:#db4a39!important;border-color:#db4a39}.wrapper.secondary{background:#f3f3f3}</style><!--[if mso]>\r\n      <style type=\"text/css\">\r\n        .f-fallback {\r\n          font-family: Arial, sans-serif;\r\n        }\r\n      </style>\r\n    <![endif]--></head><body><span class=\"preheader\">Please take a second to confirm we&#x27;ve got the correct email address for your RSS.app account.</span><table class=\"email-wrapper\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td align=\"center\"><table style=\"max-width:600px\" class=\"email-content\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td class=\"email-body\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\"><table class=\"email-body_inner\" align=\"center\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr style=\"width:100%\"><td align=\"center\"><table class=\"email-content\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td width=\"600\" style=\"padding:24px\"><a href=\"https://rss.app\" class=\"f-fallback email-masthead_name\" style=\"text-decoration:none;display:flex;width:fit-content\"><img width=\"40\" height=\"40\" src=\"https://rss.app/rss-logo?trId=\" alt=\"RSS.app logo\"> <span style=\"color:#424242;font-weight:700;font-size:24px;line-height:28px;font-family:sans-serif;margin-top:8px;margin-left:18px\">RSS.app</span></a></td></tr></table></td></tr><tr style=\"width:100%\"><td style=\"color:#424242;padding:24px\"><h1 style=\"font-size:24px;margin-bottom:30px;font-weight:700\">Confirm your email address</h1><p style=\"font-size:18px;line-height:30px;color:#444;margin-bottom:30px\">Your confirmation code is below â enter it in your open browser window and we'll help you get signed in.</p><table class=\"body-action\" align=\"center\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\" style=\"background-color:#f7f7f7;padding:18px 0;border-radius:8px\"><tr><td align=\"center\"><table width=\"100%\" border=\"0\" cellspacing=\"0\" cellpadding=\"0\" role=\"presentation\"><tr><td style=\"font-size:28px;color:#424242;text-align:center;user-select:all;font-weight:700\">934-122</td></tr></table></td></tr></table><p style=\"font-size:18px;margin-bottom:30px\">If you didnât request this email, thereâs nothing to worry about â you can safely ignore it.</p><hr><table><tbody><tr style=\"text-decoration:underline\"><td style=\"padding-right:8px;border-right:1px solid #c2c2c2\"><a style=\"color:#c2c2c2\" href=\"https://rss.app/blog\">Our Blog</a></td><td style=\"padding-right:8px;padding-left:8px;border-right:1px solid #c2c2c2\"><a style=\"color:#c2c2c2\" href=\"https://rss.app/privacy\">Policies</a></td><td style=\"padding-left:8px\"><a style=\"color:#c2c2c2\" href=\"https://help.rss.app\">Help Center</a></td></tr></tbody></table></td></tr></table></td></tr></table></td></tr><tr><td align=\"center\"><table style=\"max-width:600px\" class=\"email-content\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td><table class=\"email-footer\" align=\"center\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><!--                  <tr>--><!--                    <td style=\"text-align: center; padding-top: 46px\">--><!--                      <span--><!--                        style=\"--><!--                          display: block;--><!--                          width: 100%;--><!--                          max-width: 350px;--><!--                          margin: auto;--><!--                          font-size: 14px;--><!--                          font-weight: 400;--><!--                          line-height: 20px;--><!--                        \"--><!--                      >--><!--                        <span style=\"font-weight: 700\">Have a question</span>?--><!--                        Visit our <a style=\"color: #197df9\">FAQ page</a> for an--><!--                        answer or reach out to our customer support team.--><!--                      </span>--><!--                    </td>--><!--                  </tr>--><tr><td class=\"content-cell\" align=\"center\"><p class=\"f-fallback sub align-center\" style=\"font-family:sans-serif\">&copy; 2025 RSS.app - All rights reserved.</p></td></tr></table></td></tr></table></td></tr></table><!-- prevent Gmail on iOS font size manipulation --><div style=\"display:none;white-space:nowrap;font:15px courier;line-height:0\">&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;</div><img alt=\"\" src=\"https://7kj9346w.r.us-east-1.awstrack.me/I0/0100019bfc41b92d-926d10e0-dcb6-47f4-b063-b39fdeb03019-000000/2Kbj8OGDKwrmbg8pyeSzTtCHdjU=462\" style=\"display: none; width: 1px; height: 1px;\">\r\n</body></html>\r\n\r\n",
+          "textPlain": "",
+          "metadata": {
+            "x-pm-gluon-id": "d418caef-95f4-4b30-899b-9fdda95b9f76",
+            "content-transfer-encoding": "quoted-printable",
+            "content-type": "text/html; charset=utf-8",
+            "references": "<4Gk-fsW5nIIPgzahkOyHDNEupnK85nUCXzZFp3PjdsUVK4E3KcaGZkz_STpgNAKwV59bRfvitb33B7_T9Dc5FQ==@protonmail.internalid>",
+            "x-pm-date": "Mon, 26 Jan 2026 21:42:07 +0000",
+            "x-pm-external-id": "<01000f19bfc41b92d-926d10e0-dcb6-47f4-b063-b39fdeb03019-000000@email.amazonses.com>",
+            "x-pm-internal-id": "4Gk-fsW5nIIPgzahkOyHDNEupnKf85nUCXzZFp3PjdsUVK4E3KcaGZkz_STpgNAKwV59bRfvitb33B7_T9Dc5FQ==",
+            "reply-to": "<account_at_noreply_rss_app_ihwnxn@simplelogin.co>",
+            "return-path": "<sl.lmycyibrgeztsojrgq2tcmbmeazdcnbrge2dexi.yig3h47duwr6g@simplelogin.co>",
+            "x-original-to": "armserobyan@proton.me",
+            "delivered-to": "armserobyan@proton.me",
+            "authentication-results": "mail.protonmail.ch; dkim=pass (Good 1024 bit    rsa-sha256 signature) header.d=simplelogin.co header.a=rsa-sha256",
+            "received": "from mail-107166.simplelogin.co (mail-107166.simplelogin.co [79.135.107.166]) (using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)  key-exchange X25519 server-signature RSA-PSS (4096 bits)) (No client certificate requested) by mailinzur1016.protonmail.ch (Postfix) with ESMTPS id 4f0MSb2PVKz9vNQ0 for <armserobyan@proton.me>; Mon, 26 Jan 2026 21:42:07 +0000 (UTC)",
+            "arc-seal": "i=1; a=rsa-sha256; d=simplelogin.co; s=arc-20230626; t=1769463727; cv=none; b=S1SYK+kWXe4343NVofCm9r9gxhgqdxszFHR2aViROBEIhoczmyg9KDlYxNivPGeUTKIlBK7cl8iI+SLfqSde7StnFE1BjnrRKRxuQnDUiy0U9gVuQAtRKGntu3Ig33ci2YkuJB6r7yOkEkGZK1j/fFOz2fnClGrpjxNuV/6/3VhAfWeYClgejeat/zHqS0jf4+3Xi5ktUr28j0OzX8e3BHNDL8GMBfHydp7xTmtwwKHe8j9siDuN9EFbXeAQDDIUG976wOW9SHjw6AUFN07v0gdVEkAd9kruN01tVrzew9+vpO8eDxLKHFDaHFyH2gAuG4xvoAVtTNKVVoNk+CLY3g==",
+            "arc-message-signature": "i=1; a=rsa-sha256; d=simplelogin.co; s=arc-20230626; t=1769463727; c=relaxed/simple; bh=YB4XdqraMX3gZM1e2qgYxReAZcFcJXA1O06iuLYaQNA=; h=Subject:Date:From:Reply-To:To; b=b+5ba8wrRWH2ngIBHW6saiKSCCShkeOvbyk0Cgrc2yvSto23/48HOoBUKnKF+eiZ4yGf3l46rcZTsSYXSp36DO8Tj//mo1MAZhDrm95S+wgcfN1excphOwPnENBBMh7Sw+/5ZRLSPSomhzA0RZn5d8U6+NXlzB18Y+/q7L0I4qTnTZoprXiGxndbFm8wIXBMOFQyOITMRh9EGPCsTzjuOWRXm8UyMRa5ytwTuevZOquQdC2Gvq0LnPAmiNMf5ScFJi/IDYuP7nCUzo0tx4pBjFUNW5uFTJLt4pCPv/JadCQ+gwcA8xirNJkyhp7Ukf1WVeX92O7KwT6EvbDZzJh23g==",
+            "arc-authentication-results": "i=1; mail.protonmail.ch; dkim=pass (Good 1024 bit   rsa-sha256 signature) header.d=noreply.rss.app header.a=rsa-sha256; dkim=pass (Good 1024 bit rsa-sha256 signature) header.d=amazonses.com header.a=rsa-sha256; dmarc=pass (p=none dis=none) header.from=noreply.rss.app; spf=pass smtp.mailfrom=amazonses.com; dkim=pass (1024-bit key) header.d=noreply.rss.app header.i=@noreply.rss.app header.b=uBjEmr8o; dkim=pass (1024-bit key) header.d=amazonses.com header.i=@amazonses.com header.b=eDSQMoBw",
+            "dkim-signature": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=simplelogin.co; s=dkim; t=1769463727; h=from:from:reply-to:reply-to:subject:subject:date:date:  message-id:message-id:to:to:cc:mime-version:mime-version:  content-type:content-type:  content-transfer-encoding:content-transfer-encoding; bh=lQNiv5uOKfnFZaD9AFJpLZ9I/ZHs5xWZNp0LekgVTV8=; b=FlNadTDzI6HipZDU1jlN3KxpwMqbWJeq+fcttJISa/cBfaRXEg7FC4cym9S4H4CCJhmwVr 59F5A9xB4ToakH85XXnWSb6NT7O8x7NoB8FPLXGLU/pTn0lb9HOUfJQqky4sixH2LjNn0B WC5D7pEkBqup8B0rkGc4HbGmdy4dL7w=",
+            "mime-version": "1.0",
+            "message-id": "<010001f9bfc41b92d-926d10e0-dcb6-47f4-b063-b39fdeb03019-000000@email.amazonses.com>",
+            "x-simplelogin-type": "Forward",
+            "x-simplelogin-emaillog-id": "1139914510",
+            "x-simplelogin-envelope-from": "0100019bfc41b92d-926d10e0-dcb6-47f4-b063-b39fdeb03019-000000@amazonses.com",
+            "x-simplelogin-original-from": "RSS.app <account@noreply.rss.app>",
+            "x-simplelogin-envelope-to": "rss.uoxqo@slmail.me",
+            "x-simplelogin-want-signing": "yes",
+            "x-pm-spam": "0yezJI6YSpyJec91ztFGcjIwoJyLCvXBZcQniisnOERJt9TTVOUdSRQUiwslOjLdFJEL CN0lSXZ1BElETjIbpAuLTsV0MIRkLf1USkVMFRfSUiVUQOsltx4CMSXiwtJREWV9TQxUJF9FRiR6I0 wWydjFLLJCIM1EV0XF1NBU1i0UROslwiwSXUTNl9IRVME1VX90OikFTlOwsFdLjNCJLUd0JG9FRkUN 91UX0IV9QRFUEiIVRlOwswiXSWkNUR9FJW9lTUQJxlUREDV9WRJVUJZUSURfRxPQkF0tQRIC6sAzWj I5cEzLjxS4NMcDu2YTMGIpxRlc3pCBZbBiz01SYnczVVkdGvmJLbRmllNHZmblR5vciimccXwSiWNk UFRJ99WTlJUxQRlEUS9VWEUMJJMX0L0NTRQUiwslOCL3I4xOSuzUMMAT32EjLiNsBN0aXgWQZa4Wgu wmY2cvNUucmu2VcZVGyvN2cmcuU9tY2sl0IINlQI9lRURPx5PX0ikUTOslwiwSX1UGBBBX1i1MUOsl ts0FMlIfRVNUkF1RTXl0NFdUQjIbp19MFzCJLY92y6ISZCMiwNvc2kmVcIojtx4CMSfiwIic3insOY NW0u9WajIio5iaWi3gbLJCtz9Fb2Yy9I6ZSQyJeU9kEtojIzMsEBSIlf0RTUJFFDlEREVPlI6TiiCw MUMlix0iOjL0cJTLC6SIQLATuiwSM2XlRVnYnu2lXZ8miisnOFUPJI6RCpyJebFWnu9VZWYl1oiIj0 HNaYNWrpZ2XmbfVVudHfWRZcVHfyAjMjNxAkiMDtCJLYlWswNzXlct9Rlb26CIbI1mhzwWaHctIIwL TwjYMMAT20BnLiIiwFpbWzF8bcJHfvJHciY6I45MC0TkONQj53gDODM0gYxOTtCJLYlWs4VGdFdl9J lbWpGRZbdmfk9WbWZiwJpOimnRbb9Ght9CdWd0xxpaW1mdbYwWttUTZ2ch1wibGwCJLXN3wi0WYjOu AA5MDxTMMOAD15MDMTOyQY1MjwCJLXN3wf1WYmYzFI6ZSwC4MMkDx4EzMDMwUk5MzyDINNUjsfBnI3 cpdNodGv3RXXB3ooNXaWan5owIjyjALMETyzITODMzAMzNz4TUMLJCyf5WdmbtFI6ZSsmFIb1Cm0FW ZXdlJ1wcyzV9ddl20ig2YXf91JzLCkmlcIoji3kjN2NmRA4YjyWYMYITy3gDZTNiFMyMG9n1I",
+            "x-pm-original-from": "account_at_noreply_rss_app_ihwnxn@simplelogin.co",
+            "x-pm-origin": "external",
+            "x-pm-transfer-encryption": "TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)",
+            "x-pm-content-encryption": "on-delivery",
+            "x-pm-spamscore": "0",
+            "x-pm-spam-action": "inbox"
+          },
+          "attributes": {
+            "uid": 604
+          },
+          "to": "\"rss\" <rss.uoxqo@slmail.me>",
+          "from": "\"RSS.app\" <account@noreply.rss.app>",
+          "subject": "🎉 Please confirm your email",
+          "date": "Mon, 26 Jan 2026 21:42:04 +0000"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Should Process Email?": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Matrix Message": {
+      "main": [
+        [
+          {
+            "node": "Send to Matrix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract OTP and Links": {
+      "main": [
+        [
+          {
+            "node": "Format Matrix Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitor Finance Emails": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Email Content": {
+      "main": [
+        [
+          {
+            "node": "Filter OTP Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter OTP Emails": {
+      "main": [
+        [
+          {
+            "node": "Should Process Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitor Inbox": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if Already Processed": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send to Matrix": {
+      "main": [
+        [
+          {
+            "node": "Store Processed Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Extract Email Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields1": {
+      "main": [
+        [
+          {
+            "node": "Check if Already Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Extract OTP and Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "ce02b52d-74a2-4118-994a-b81581afb7d3",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "77b0cb390f6970faa6e2efe00fb916b09762a91ec7ae1792ceddbe5cb00bb330"
+  },
+  "id": "OWmwL1yZlaaCYsWM",
+  "tags": []
+}
