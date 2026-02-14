@@ -14,7 +14,7 @@ Fetches RSS feeds across Sports, Tech, and World News — filters by keywords, s
 
 **Tech:** n8n, RSS, Claude AI (Anthropic), Matrix, HTML
 
-[View Details](ai-news-digest/) · [Download JSON](https://github.com/arm-ser/n8n-automation-portfolio/raw/main/ai-news-digest/AI-Powered%20News%20Digest%20Template.json)
+[View Details](ai-news-digest/) · <a href="https://github.com/arm-ser/n8n-automation-portfolio/raw/main/ai-news-digest/AI-Powered%20News%20Digest%20Template.json" download>Download JSON</a>
 
 ---
 
@@ -25,7 +25,7 @@ Scans pre-market gainers every 5 minutes using 5 screening criteria (price, gap,
 
 **Tech:** n8n, REST APIs (mboum), Matrix, Technical Analysis
 
-[View Details](day-trading-scanner/) · [Download JSON](https://github.com/arm-ser/n8n-automation-portfolio/raw/main/day-trading-scanner/Day%20Trading%20Pre-Market%20Scanner%20Template.json)
+[View Details](day-trading-scanner/) · <a href="https://github.com/arm-ser/n8n-automation-portfolio/raw/main/day-trading-scanner/Day%20Trading%20Pre-Market%20Scanner%20Template.json" download>Download JSON</a>
 
 > *Disclaimer: Educational template only. Not financial advice.*
 
@@ -38,7 +38,7 @@ Watches IMAP mailboxes for 2FA emails, uses regex scoring to extract verificatio
 
 **Tech:** n8n, IMAP, PostgreSQL, Regex, Matrix
 
-[View Details](email-otp-extractor/) · [Download JSON](https://github.com/arm-ser/n8n-automation-portfolio/raw/main/email-otp-extractor/Email%202FA%20OTP%20Extractor%20Template.json)
+[View Details](email-otp-extractor/) · <a href="https://github.com/arm-ser/n8n-automation-portfolio/raw/main/email-otp-extractor/Email%202FA%20OTP%20Extractor%20Template.json" download>Download JSON</a>
 
 ---
 
