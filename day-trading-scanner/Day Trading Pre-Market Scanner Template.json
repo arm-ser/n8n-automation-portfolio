@@ -1,0 +1,559 @@
+{
+  "name": "Day Trading Pre-Market Scanner Template",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/5 6-8 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "4457d7c6-1bed-4ec7-ac4b-1baa92f769e5",
+      "name": "Schedule (6-8:30 AM PT)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        2816,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.mboum.com/v2/markets/movers",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "change_type",
+              "value": "PERCENT"
+            },
+            {
+              "name": "direction",
+              "value": "UP"
+            },
+            {
+              "name": "price_min",
+              "value": "2"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_MBOUM_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6bd28b88-7968-472e-87ef-04b685abfd74",
+      "name": "Fetch Day Gainers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3040,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ross Cameron's 5 Criteria Filter\nconst movers = $input.first().json.body || [];\n\nconst criteria = {\n  minPrice: 2,\n  maxPrice: 20,\n  minGapPercent: 10,\n  maxFloat: 10000,        // API returns in THOUSANDS, so 10000 = 10M shares\n  minRelativeVolume: 5\n};\n\nconst qualified = [];\n\nfor (const stock of movers) {\n  const price = parseFloat(stock.lastPrice?.replace(/[^0-9.]/g, '') || 0);\n  const pctChange = parseFloat(stock.percentChange?.replace(/[^0-9.-]/g, '') || 0);\n  const volume = parseInt(stock.volume?.replace(/,/g, '') || 0);\n  // Float is in THOUSANDS from API\n  const floatThousands = parseInt(stock.float?.replace(/,/g, '') || 999999999);\n  \n  const priceOk = price >= criteria.minPrice && price <= criteria.maxPrice;\n  const gapOk = pctChange >= criteria.minGapPercent;\n  const floatOk = floatThousands < criteria.maxFloat;\n  \n  if (priceOk && gapOk && floatOk) {\n    qualified.push({\n      symbol: stock.symbol,\n      name: stock.symbolName,\n      price: price,\n      changePercent: pctChange,\n      volume: volume,\n      floatThousands: floatThousands,\n      floatActual: floatThousands * 1000,\n      floatDisplay: (floatThousands / 1000).toFixed(2) + 'M',\n      passed: true\n    });\n  }\n}\n\nconst top5 = qualified.slice(0, 5);\n\nif (top5.length === 0) {\n  return [{ json: { noStocks: true, passed: false, message: 'No stocks meeting all criteria' } }];\n}\n\nreturn top5.map(stock => ({ json: stock }));"
+      },
+      "id": "f66c2dd5-a5a3-4fa6-9cec-53f4bdb0760f",
+      "name": "Filter 5 Criteria",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3264,
+        1056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "check-stocks",
+              "leftValue": "={{ $json.passed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7c643e93-2d66-4536-91e3-c0370320d12a",
+      "name": "Stocks Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3936,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.mboum.com/v1/markets/stock/history",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ticker",
+              "value": "={{ $json.symbol }}"
+            },
+            {
+              "name": "interval",
+              "value": "1m"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_MBOUM_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6ce8f12e-dba5-4600-9b57-207f0bab31e2",
+      "name": "Fetch 1-Min Candles",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4160,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Bull Flag Pullback Detection with Squeeze & R:R\nconst stockData = $('Apply Volume Filter').item.json;\nconst candleData = $input.first().json.body || {};\n\nconst candles = Object.entries(candleData)\n  .map(([ts, data]) => ({ timestamp: parseInt(ts), ...data }))\n  .filter(c => c.volume > 0 && c.high > 0)\n  .sort((a, b) => a.timestamp - b.timestamp);\n\nif (candles.length < 10) {\n  return [{ json: { ...stockData, pattern: 'INSUFFICIENT_DATA', alert: false } }];\n}\n\n// Use FULL session data for high/low/current price\nconst sessionHigh = Math.max(...candles.map(c => c.high));\nconst sessionLow = Math.min(...candles.map(c => c.low));\nconst currentPrice = candles[candles.length - 1].close;\nconst range = sessionHigh - sessionLow;\n\n// === SQUEEZE DETECTION ===\n// Look for squeeze in EARLY session (first 60 candles = first hour)\nconst earlySession = candles.slice(0, Math.min(60, candles.length));\nlet squeezeCandles = [];\nlet maxConsecutiveGreen = 0;\n\nfor (let i = 0; i < earlySession.length; i++) {\n  const candle = earlySession[i];\n  const isGreen = candle.close > candle.open;\n  \n  if (isGreen) {\n    squeezeCandles.push(candle);\n    maxConsecutiveGreen = Math.max(maxConsecutiveGreen, squeezeCandles.length);\n  } else {\n    squeezeCandles = [];\n  }\n}\n\nconst hadSqueeze = maxConsecutiveGreen >= 3;\n\n// === PULLBACK DETECTION ===\nconst retracementFromHigh = range > 0 ? ((sessionHigh - currentPrice) / range) * 100 : 0;\nconst holdingAbove50 = currentPrice > (sessionLow + range * 0.5);\nconst isPullback = retracementFromHigh >= 15 && retracementFromHigh <= 50 && holdingAbove50;\n\n// Use recent 30 candles for pullback range (consolidation area)\nconst recentCandles = candles.slice(-30);\nconst pullbackHigh = Math.max(...recentCandles.map(c => c.high));\nconst pullbackLow = Math.min(...recentCandles.map(c => c.low));\n\n// === VOLUME ANALYSIS ===\nconst recent = candles.slice(-30);\nconst last5 = recent.slice(-5);\nconst prev5 = recent.slice(-10, -5);\nconst avgVolLast5 = last5.reduce((sum, c) => sum + c.volume, 0) / 5;\nconst avgVolPrev5 = prev5.reduce((sum, c) => sum + c.volume, 0) / 5;\nconst volumeDecreasing = avgVolLast5 < avgVolPrev5;\n\n// === ENTRY SIGNAL DETECTION ===\nconst isBreakingOut = currentPrice > pullbackHigh && pullbackHigh > 0;\n\n// === PATTERN STATE MACHINE ===\nlet pattern = 'NO_SETUP';\nlet alertType = null;\n\nif (hadSqueeze && isPullback && volumeDecreasing) {\n  pattern = 'PULLBACK_FORMING';\n  alertType = 'WATCH_FOR_ENTRY';\n} else if (hadSqueeze && isBreakingOut && holdingAbove50) {\n  pattern = 'ENTRY_SIGNAL';\n  alertType = 'ENTRY_OPPORTUNITY';\n} else if (isPullback && !hadSqueeze) {\n  pattern = 'PULLBACK_NO_SQUEEZE';\n  alertType = null;\n}\n\n// === RISK/REWARD CALCULATION ===\nlet analysis = {\n  sessionHigh: sessionHigh.toFixed(2),\n  sessionLow: sessionLow.toFixed(2),\n  currentPrice: currentPrice.toFixed(2),\n  retracementPct: retracementFromHigh.toFixed(1),\n  holdingAbove50pct: holdingAbove50,\n  volumeDecreasing,\n  hadSqueeze,\n  maxConsecutiveGreen\n};\n\nif (pattern === 'PULLBACK_FORMING' || pattern === 'ENTRY_SIGNAL') {\n  // ENTRY: Pullback high for watch, current price for entry signal\n  const entryPrice = pattern === 'ENTRY_SIGNAL' ? currentPrice : pullbackHigh;\n  \n  // STOP: Low of pullback\n  const stopPrice = pullbackLow;\n  \n  // TARGET: Session high (conservative)\n  const targetPrice = sessionHigh;\n  \n  // Calculate R:R\n  const risk = entryPrice - stopPrice;\n  const reward = targetPrice - entryPrice;\n  const riskRewardRatio = risk > 0 ? reward / risk : 0;\n  \n  // Filter out setups with R:R < 2:1\n  if (riskRewardRatio < 2) {\n    pattern = 'RR_TOO_LOW';\n    alertType = null;\n  }\n  \n  // Add R:R details to analysis\n  analysis.entry = entryPrice.toFixed(2);\n  analysis.stop = stopPrice.toFixed(2);\n  analysis.target = targetPrice.toFixed(2);\n  analysis.risk = risk.toFixed(2);\n  analysis.reward = reward.toFixed(2);\n  analysis.rr = riskRewardRatio.toFixed(2);\n}\n\nreturn [{\n  json: {\n    ...stockData,\n    pattern,\n    alertType,\n    alert: alertType !== null,\n    analysis\n  }\n}];\n"
+      },
+      "id": "dcae61ee-9c8b-498a-938d-cd447a8260da",
+      "name": "Detect Pullback Pattern",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4384,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "alert-check",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d73c67c9-cdf6-46c5-bc91-1f7833dad6c6",
+      "name": "Alert Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4608,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.mboum.com/v2/markets/news",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ticker",
+              "value": "={{ $json.symbol }} "
+            },
+            {
+              "name": "type",
+              "value": "ALL"
+            },
+            {
+              "name": "apikey",
+              "value": "YOUR_MBOUM_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "661f1e86-88e0-4969-955f-59d723a3bd37",
+      "name": "Fetch News",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4832,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const stock = $('Detect Pullback Pattern').item.json;\nconst newsData = $input.first().json.body || [];\n\nconst latestNews = newsData.length > 0 ? newsData[0] : null;\nconst catalyst = latestNews ? latestNews.title : 'No recent news found';\nconst newsTime = latestNews ? latestNews.ago : '';\n\nconst a = stock.analysis;\n\n// Different emoji and title based on alert type\nconst alertEmoji = stock.alertType === 'ENTRY_OPPORTUNITY' ? '🚀' : '🎯';\nconst alertTitle = stock.alertType === 'ENTRY_OPPORTUNITY' ? 'ENTRY SIGNAL' : 'WATCH FOR ENTRY';\n\n// Build setup quality indicators\nconst setupQuality = [];\nif (a.hadSqueeze) setupQuality.push(`✅ Squeeze (${a.maxConsecutiveGreen} green)`);\nif (a.holdingAbove50pct) setupQuality.push('✅ Above 50%');\nif (a.volumeDecreasing) setupQuality.push('✅ Volume declining');\nif (stock.relativeVolume >= 5) setupQuality.push(`✅ Vol: ${stock.relativeVolumeDisplay}`);\n\n// Build R:R section if available\nlet rrSection = '';\nif (a.rr) {\n  rrSection = `\\n💰 **Risk/Reward:**\\n• Entry: $${a.entry}\\n• Stop: $${a.stop} (Risk: $${a.risk})\\n• Target: $${a.target} (Reward: $${a.reward})\\n• R:R Ratio: ${a.rr}:1 ${parseFloat(a.rr) >= 3 ? '⭐ Excellent' : '✓ Good'}`;\n}\n\nconst message = `${alertEmoji} **${alertTitle}** - $${stock.symbol}\\n\\n**${stock.name}**\\nPrice: $${a.currentPrice} | Change: +${stock.changePercent}%\\n\\n📊 **Technical Setup:**\\n• Session High: $${a.sessionHigh}\\n• Session Low: $${a.sessionLow}\\n• Retracement: ${a.retracementPct}% from high\\n${setupQuality.join('\\n• ')}${rrSection}\\n\\n📈 **Stock Stats:**\\n• Float: ${stock.floatDisplay}\\n• Volume: ${stock.volume.toLocaleString()}\\n• Relative Volume: ${stock.relativeVolumeDisplay}\\n\\n📰 **Catalyst:** ${catalyst}\\n${newsTime ? '(' + newsTime + ')' : ''}\\n\\n⏰ ${new Date().toLocaleTimeString('en-US', {timeZone: 'America/Los_Angeles'})}`;\n\nreturn [{ json: { message, symbol: stock.symbol, alertType: stock.alertType } }];"
+      },
+      "id": "654ffa13-2b7c-4663-9e10-e0133fe68c13",
+      "name": "Format Alert Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5056,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst stocks = items.map(item => item.json).filter(s => s.passed === true);\n\nif (stocks.length === 0) {\n  return [{ json: { message: '📋 **No stocks meeting criteria right now**\\n\\nCriteria: $2-20, +10%+, Float <10M\\nWill check again in 5 minutes.', sendSummary: false } }];\n}\n\nconst lines = stocks.map(s => \n  `• **$${s.symbol}** - ${s.name}\\n  Price: $${s.price.toFixed(2)} | +${s.changePercent}% | Float: ${s.floatDisplay}`\n);\n\nconst message = `📋 **WATCHLIST UPDATE**\\n\\n${lines.join('\\n\\n')}\\n\\n⏰ ${new Date().toLocaleTimeString('en-US', {timeZone: 'America/Los_Angeles'})}`;\n\nreturn [{ json: { message, sendSummary: true, count: stocks.length } }];"
+      },
+      "id": "a42694c1-f84e-4add-9048-89c4e7b07b99",
+      "name": "Compile Watchlist",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3488,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "roomId": "!YOUR_ROOM_ID:your.matrix.server",
+        "text": "={{ $json.formatted_body }}",
+        "messageFormat": "org.matrix.custom.html"
+      },
+      "id": "e233070d-65bf-43d1-9fac-793420d1df77",
+      "name": "Send Watchlist",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [
+        3936,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.mboum.com/v2/markets/stock/ticker-summary",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "=ticker",
+              "value": "={{ $json.symbol }}"
+            },
+            {
+              "name": "type",
+              "value": "STOCKS"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer 335|an4vjlIVPnNgX4w6ZxXEUz603uUo7xMN7uHehncK"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "075888e7-0cb3-46b8-bbd6-de71c1698abe",
+      "name": "Enrich with Volume Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3488,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ross Cameron Criterion #4: Relative Volume >= 2x\nconst stockData = $('Filter 5 Criteria').item.json;\nconst apiResponse = $input.first().json;\n\n// Extract volume data from /v2/ticker-summary response\nconst summaryData = apiResponse.body?.summaryData || {};\n\n// Current volume from movers endpoint (from Filter 5 Criteria)\nconst currentVolumeStr = stockData.volume?.toString() || '0';\nconst currentVolume = parseInt(currentVolumeStr.replace(/,/g, ''));\n\n// Average volume from ticker-summary endpoint\nconst avgVolumeStr = summaryData.AverageVolume?.value || '0';\nconst averageVolume = parseInt(avgVolumeStr.replace(/,/g, ''));\n\n// Calculate relative volume (current / average)\nconst relativeVolume = averageVolume > 0 ? currentVolume / averageVolume : 0;\n\n// Ross Cameron criterion: >= 2x relative volume\nif (relativeVolume >= 2) {\n  return [{\n    json: {\n      ...stockData,\n      currentVolume,\n      averageVolume,\n      relativeVolume: parseFloat(relativeVolume.toFixed(2)),\n      relativeVolumeDisplay: relativeVolume.toFixed(1) + 'x',\n      passedVolumeCheck: true\n    }\n  }];\n} else {\n  // Stock doesn't meet volume criterion - filter out\n  return [];\n}\n"
+      },
+      "id": "af0660b9-de01-47ea-ba3a-e661dcc5086e",
+      "name": "Apply Volume Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get data from previous node - works with ANY previous node\nconst inputData = $input.first().json;\n\n// Try common field names for AI agent responses\nconst agentResponse = inputData.output || \n                      inputData.agent_response || \n                      inputData.response || \n                      inputData.message || \n                      inputData.text || \n                      '';\n\nconst markdown = agentResponse;\n\n// Convert markdown tables to pretty text format\nfunction convertTables(text) {\n  const tableRegex = /(\\|.+\\|\\n)(\\|[-:\\s|]+\\|\\n)((?:\\|.+\\|\\n?)+)/g;\n  \n  return text.replace(tableRegex, (match, header, separator, rows) => {\n    const headers = header.split('|').filter(h => h.trim()).map(h => h.trim());\n    const rowArray = rows.trim().split('\\n').map(row => \n      row.split('|').filter(cell => cell.trim()).map(cell => cell.trim())\n    );\n    \n    let plainText = '<br>✦✧ Transaction Details ✧✦<br>';\n    \n    rowArray.forEach(row => {\n      let rowText = '';\n      row.forEach((cell, idx) => {\n        if (idx === 0) {\n          rowText += '<strong>' + cell + ':</strong> ';\n        } else {\n          rowText += cell;\n        }\n      });\n      plainText += rowText + '<br>';\n    });\n    \n    plainText += '✦✧✦✧✦✧✦✧✦✧✦✧✦✧✦<br>';\n    return plainText;\n  });\n}\n\n// Create plain text version (strip markdown)\nconst plainText = markdown\n  .replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '$1')\n  .replace(/\\*\\*(.+?)\\*\\*/g, '$1')\n  .replace(/\\*(.+?)\\*/g, '$1')\n  .replace(/`(.+?)`/g, '$1')\n  .replace(/^###? (.+)$/gm, '$1')\n  .replace(/^\\|.+$/gm, '');\n\n// Convert markdown to HTML\nlet html = convertTables(markdown);\nhtml = html\n  .replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>')\n  .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')\n  .replace(/\\*(.+?)\\*/g, '<em>$1</em>')\n  .replace(/`(.+?)`/g, '<code>$1</code>')\n  .replace(/^### (.+)$/gm, '<strong>$1</strong>')\n  .replace(/^## (.+)$/gm, '<strong>$1</strong>')\n  .replace(/^# (.+)$/gm, '<strong>$1</strong>')\n  .replace(/\\n\\n/g, '<br>')\n  .replace(/\\n/g, '<br>');\n\n// Wrap in div\nhtml = '<div>' + html + '</div>';\n\n// Return in Matrix format - no room_id needed\nreturn {\n  json: {\n    body: plainText,\n    msgtype: \"m.text\",\n    format: \"org.matrix.custom.html\",\n    formatted_body: html\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        1152
+      ],
+      "id": "d9c33fa6-b248-426f-ab28-ad3179ab671e",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get data from previous node - works with ANY previous node\nconst inputData = $input.first().json;\n\n// Try common field names for AI agent responses\nconst agentResponse = inputData.output || \n                      inputData.agent_response || \n                      inputData.response || \n                      inputData.message || \n                      inputData.text || \n                      '';\n\nconst markdown = agentResponse;\n\n// Convert markdown tables to pretty text format\nfunction convertTables(text) {\n  const tableRegex = /(\\|.+\\|\\n)(\\|[-:\\s|]+\\|\\n)((?:\\|.+\\|\\n?)+)/g;\n  \n  return text.replace(tableRegex, (match, header, separator, rows) => {\n    const headers = header.split('|').filter(h => h.trim()).map(h => h.trim());\n    const rowArray = rows.trim().split('\\n').map(row => \n      row.split('|').filter(cell => cell.trim()).map(cell => cell.trim())\n    );\n    \n    let plainText = '<br>✦✧ Transaction Details ✧✦<br>';\n    \n    rowArray.forEach(row => {\n      let rowText = '';\n      row.forEach((cell, idx) => {\n        if (idx === 0) {\n          rowText += '<strong>' + cell + ':</strong> ';\n        } else {\n          rowText += cell;\n        }\n      });\n      plainText += rowText + '<br>';\n    });\n    \n    plainText += '✦✧✦✧✦✧✦✧✦✧✦✧✦✧✦<br>';\n    return plainText;\n  });\n}\n\n// Create plain text version (strip markdown)\nconst plainText = markdown\n  .replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '$1')\n  .replace(/\\*\\*(.+?)\\*\\*/g, '$1')\n  .replace(/\\*(.+?)\\*/g, '$1')\n  .replace(/`(.+?)`/g, '$1')\n  .replace(/^###? (.+)$/gm, '$1')\n  .replace(/^\\|.+$/gm, '');\n\n// Convert markdown to HTML\nlet html = convertTables(markdown);\nhtml = html\n  .replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>')\n  .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')\n  .replace(/\\*(.+?)\\*/g, '<em>$1</em>')\n  .replace(/`(.+?)`/g, '<code>$1</code>')\n  .replace(/^### (.+)$/gm, '<strong>$1</strong>')\n  .replace(/^## (.+)$/gm, '<strong>$1</strong>')\n  .replace(/^# (.+)$/gm, '<strong>$1</strong>')\n  .replace(/\\n\\n/g, '<br>')\n  .replace(/\\n/g, '<br>');\n\n// Wrap in div\nhtml = '<div>' + html + '</div>';\n\n// Return in Matrix format - no room_id needed\nreturn {\n  json: {\n    body: plainText,\n    msgtype: \"m.text\",\n    format: \"org.matrix.custom.html\",\n    formatted_body: html\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        960
+      ],
+      "id": "4c1b7139-e133-4dae-aa74-668f13bd98b5",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "roomId": "!YOUR_ROOM_ID:your.matrix.server",
+        "text": "={{ $json.formatted_body }}",
+        "messageFormat": "org.matrix.custom.html"
+      },
+      "id": "25dd7e59-cf76-4b5b-a4e1-75d8996a7140",
+      "name": "Send Watchlist1",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [
+        5504,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 📋 PREREQUISITES\n\n**API Keys needed:**\n1. **mboum.com API** — for market data (gainers, candles, news, volume)\n   Get yours at: https://mboum.com\n2. **Matrix Account** — for sending trade alerts\n\n**To set up:**\n1. Import this workflow into n8n\n2. Sign up for mboum.com API and get your API key\n3. Replace YOUR_MBOUM_API_KEY in all HTTP Request nodes\n4. Create Matrix credential and update room IDs\n5. Adjust schedule to your market timezone",
+        "height": 300,
+        "width": 420
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        2800,
+        512
+      ],
+      "name": "Sticky Prerequisites",
+      "id": "632dd06d-f63b-433f-91f1-1cdf817cc6e2",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## 🔔 NOTIFICATIONS\n\nThis template uses **Matrix** for sending trade alerts.\n\nYou can replace the Matrix nodes with any preferred notification service:\n- **Slack** — use the Slack node\n- **Discord** — use the Discord node\n- **Telegram** — use the Telegram node\n- **Email** — use the Send Email node\n\nJust replace each Matrix node with your preferred service and map the message content field accordingly.",
+        "height": 250,
+        "width": 420
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        3696,
+        512
+      ],
+      "name": "Sticky Notifications",
+      "id": "81f1384b-6ef9-44d4-a5f8-0b2da4f15f55",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "content": "## ⚙️ HOW TO CUSTOMIZE\n\n**Scanner Criteria (\"Filter 5 Criteria\" node):**\n- Price range: $2-$20 (adjustable)\n- Gap %: 10%+ pre-market gap\n- Float: <10M shares (small cap focus)\n- Relative Volume: 5x+ normal\n\n**Pullback Detection (\"Detect Pullback Pattern\" node):**\n- Detects bull flag patterns on 1-min candles\n- Configurable squeeze and risk:reward ratios\n\n**Schedule:**\n- Default: Every 5 min, 6:00-8:30 AM PT (pre-market)\n- Adjust cron expression for your timezone/hours\n\n**Disclaimer:** This is an educational automation template. Not financial advice. Always do your own research.",
+        "height": 350,
+        "width": 420
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        3248,
+        512
+      ],
+      "name": "Sticky Customization",
+      "id": "84ad1044-8112-41ac-9769-1073325a2987",
+      "typeVersion": 1
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule (6-8:30 AM PT)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Day Gainers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Day Gainers": {
+      "main": [
+        [
+          {
+            "node": "Filter 5 Criteria",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter 5 Criteria": {
+      "main": [
+        [
+          {
+            "node": "Enrich with Volume Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stocks Found?": {
+      "main": [
+        [
+          {
+            "node": "Fetch 1-Min Candles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch 1-Min Candles": {
+      "main": [
+        [
+          {
+            "node": "Detect Pullback Pattern",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Pullback Pattern": {
+      "main": [
+        [
+          {
+            "node": "Alert Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Needed?": {
+      "main": [
+        [
+          {
+            "node": "Fetch News",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch News": {
+      "main": [
+        [
+          {
+            "node": "Format Alert Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert Message": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compile Watchlist": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich with Volume Data": {
+      "main": [
+        [
+          {
+            "node": "Apply Volume Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Volume Filter": {
+      "main": [
+        [
+          {
+            "node": "Stocks Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Send Watchlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Send Watchlist1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "75bc0968-f498-4e09-bf67-e7e89d34423f",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "77b0cb390f6970faa6e2efe00fb916b09762a91ec7ae1792ceddbe5cb00bb330"
+  },
+  "id": "OWmwL1yZlaaCYsWM",
+  "tags": []
+}
